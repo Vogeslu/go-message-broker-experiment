@@ -3,12 +3,9 @@ package listener
 import (
 	"fmt"
 	"io"
+	"message_broker/internal/command"
 	"message_broker/internal/config"
-	"message_broker/internal/controller"
-	"message_broker/internal/interpreter"
 	"message_broker/internal/logger"
-	"message_broker/internal/middleware"
-	"message_broker/internal/output"
 	"message_broker/internal/session"
 	"message_broker/internal/subscription"
 	"net"
@@ -45,10 +42,11 @@ func handleConnection(conn net.Conn) {
 	sess := session.CreateSession(conn)
 
 	buffer := make([]byte, 1024)
-	var currentPayload []string
+	var nextArgument *command.Argument = nil
 
 	for {
-		conn.Write([]byte(getSessionPrefix(sess)))
+		conn.Write([]byte(getSessionPrefix(sess, nextArgument)))
+		nextArgument = nil
 
 		n, err := conn.Read(buffer)
 		if err != nil {
@@ -63,45 +61,22 @@ func handleConnection(conn net.Conn) {
 
 		line := strings.TrimRight(string(buffer[:n]), "\n")
 
-		if line != "." {
-			currentPayload = append(currentPayload, line)
-		} else if len(currentPayload) > 0 {
-			err, messageType := interpreter.ParseMessageType(sess, currentPayload)
-			payloadData := currentPayload[1:]
-			currentPayload = nil
+		err, missingArguments, response := command.ParseLineInput(sess, line)
+		if err != nil {
+			conn.Write([]byte(fmt.Sprintf("Error: %s\n", err.Error())))
 
-			if err != nil {
-				conn.Write([]byte(err.Error() + "\n"))
+			if missingArguments == nil {
 				continue
 			}
+		}
 
-			err = middleware.HandleMiddleware(sess, messageType)
+		if len(missingArguments) > 0 {
+			nextArgument = &missingArguments[0]
+			continue
+		}
 
-			if err != nil {
-				conn.Write([]byte(err.Error() + "\n"))
-				continue
-			}
-
-			err, payload := interpreter.ParsePayload(payloadData, messageType)
-
-			if err != nil {
-				conn.Write([]byte(err.Error() + "\n"))
-				continue
-			}
-
-			err, data := controller.HandleAction(sess, messageType, payload)
-			if err != nil {
-				conn.Write([]byte(err.Error() + "\n"))
-				continue
-			}
-
-			output := output.OutputData(messageType, data)
-
-			if output != nil {
-				for i := range output {
-					conn.Write([]byte(output[i] + "\n"))
-				}
-			}
+		for i := range response {
+			conn.Write([]byte(response[i] + "\n"))
 		}
 	}
 
@@ -109,10 +84,20 @@ func handleConnection(conn net.Conn) {
 	session.RemoveSession(conn)
 }
 
-func getSessionPrefix(session *session.Session) string {
+func getSessionPrefix(session *session.Session, nextArgument *command.Argument) string {
+	prefix := ""
+
 	if session.Name != nil {
-		return fmt.Sprintf("%s > ", *session.Name)
+		prefix = fmt.Sprintf("[%s] ", *session.Name)
 	} else {
-		return "? > "
+		prefix = "[?] "
 	}
+
+	if nextArgument != nil {
+		prefix += fmt.Sprintf("%s: ", nextArgument.Name)
+	} else {
+		prefix += "> "
+	}
+
+	return prefix
 }
